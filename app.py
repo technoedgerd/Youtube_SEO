@@ -1,114 +1,100 @@
-from fastapi import FastAPI, HTTPException
-from dotenv import load_dotenv
-from pydantic import BaseModel
 import os
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import RedirectResponse
+from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
 import requests
+from dotenv import load_dotenv
 
-# --------------------------------------------------
-# Load environment variables
-# --------------------------------------------------
 load_dotenv()
 
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
-VIDEO_API_KEY = os.getenv("VIDEO_API_KEY")
+app = FastAPI(title="GPT + OAuth + YouTube Backend")
 
-if not PEXELS_API_KEY:
-    raise RuntimeError("PEXELS_API_KEY missing in .env")
+CLIENT_ID = os.getenv("YOUTUBE_CLIENT_ID")
+CLIENT_SECRET = os.getenv("YOUTUBE_CLIENT_SECRET")
+REDIRECT_URI = os.getenv("YOUTUBE_REDIRECT_URI")
 
-# --------------------------------------------------
-# Disable OpenAPI / Docs
-# --------------------------------------------------
-app = FastAPI(
-    title="Media Backend API",
-    docs_url=None,
-    redoc_url=None,
-    openapi_url=None
+SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
+
+# ⚠ In production use database
+token_store = {}
+
+def build_flow():
+    return Flow.from_client_config(
+        {
+            "web": {
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [REDIRECT_URI],
+            }
+        },
+        scopes=SCOPES,
+    )
+
+@app.get("/auth/start")
+def auth_start():
+    flow = build_flow()
+    flow.redirect_uri = REDIRECT_URI
+
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true"
+    )
+
+    return RedirectResponse(auth_url)
+
+
+@app.get("/auth/callback")
+def auth_callback(request: Request):
+    flow = build_flow()
+    flow.redirect_uri = REDIRECT_URI
+
+    flow.fetch_token(authorization_response=str(request.url))
+
+    credentials = flow.credentials
+
+    token_store["admin"] = {
+        "token": credentials.token,
+        "refresh_token": credentials.refresh_token,
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "token_uri": "https://oauth2.googleapis.com/token"
+    }
+
+    return {"message": "OAuth successful"}
+
+
+@app.get("/yt/my-channel")
+def my_channel():
+    if "admin" not in token_store:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    creds_data = token_store["admin"]
+
+    credentials = Credentials(
+        token=creds_data["token"],
+        refresh_token=creds_data["refresh_token"],
+        token_uri=creds_data["token_uri"],
+        client_id=creds_data["client_id"],
+        client_secret=creds_data["client_secret"],
+        scopes=SCOPES
+    )
+
+    headers = {
+        "Authorization": f"Bearer {credentials.token}"
+    }
+
+    r = requests.get(
+        "https://www.googleapis.com/youtube/v3/channels",
+        headers=headers,
+        params={
+            "part": "snippet,statistics",
+            "mine": "true"
+        }
+    )
+
+    return r.json()
 )
 
-# --------------------------------------------------
-# Request Models
-# --------------------------------------------------
-class MediaRequest(BaseModel):
-    type: str
-    prompt: str
-    orientation: str = "landscape"
-
-# --------------------------------------------------
-# Health Check
-# --------------------------------------------------
-@app.get("/")
-def home():
-    return {"status": "Backend running without RAG"}
-
-# --------------------------------------------------
-# IMAGE GENERATION (Pexels)
-# --------------------------------------------------
-@app.post("/generate-image")
-def generate_image(payload: MediaRequest):
-
-    if payload.type != "image":
-        raise HTTPException(status_code=400, detail="Only image type supported")
-
-    headers = {
-        "Authorization": PEXELS_API_KEY
-    }
-
-    params = {
-        "query": payload.prompt,
-        "per_page": 1,
-        "orientation": payload.orientation
-    }
-
-    response = requests.get(
-        "https://api.pexels.com/v1/search",
-        headers=headers,
-        params=params,
-        timeout=10
-    )
-
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Failed to fetch from Pexels")
-
-    data = response.json()
-
-    if not data.get("photos"):
-        raise HTTPException(status_code=404, detail="No images found")
-
-    photo = data["photos"][0]
-
-    return {
-        "media_type": "image",
-        "image_url": photo["src"]["large"],
-        "photographer": photo["photographer"],
-        "source": "pexels"
-    }
-
-# --------------------------------------------------
-# VIDEO GENERATION (Example Structure)
-# Replace URL with your real video API
-# --------------------------------------------------
-@app.post("/generate-video")
-def generate_video(payload: MediaRequest):
-
-    if payload.type != "video":
-        raise HTTPException(status_code=400, detail="Only video type supported")
-
-    headers = {
-        "Authorization": f"Bearer {VIDEO_API_KEY}"
-    }
-
-    body = {
-        "prompt": payload.prompt
-    }
-
-    response = requests.post(
-        "https://your-video-api.com/generate",
-        headers=headers,
-        json=body,
-        timeout=20
-    )
-
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Video API failed")
-
-    return response.json()
